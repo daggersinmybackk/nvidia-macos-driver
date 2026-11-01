@@ -1054,6 +1054,13 @@ static void nvmtl_busy_wait(IOSurfaceRef surf, NSUInteger plane)
         if (now - t0 > NVMTL_BUSY_WAIT_NS || (t.stamp_ns <= now && now - t.stamp_ns > NVMTL_BUSY_STALE_NS)) return;
     }
 }
+// A surface wrapper is made writable (a storage image, and ShaderWrite in its usage) unless its descriptor is framebufferOnly
+// or the process is WindowServer, which wraps hundreds of surfaces a second, none of them Core Image targets.
+static BOOL nvmtl_surface_writable_by_default(BOOL fbo) {
+    static int ws = -1;
+    if (ws < 0) { const char *me = getprogname(); ws = me && !strcmp(me, "WindowServer"); }
+    return !fbo && !ws;
+}
 static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInteger plane, uint32_t w, uint32_t h,
                                       uint32_t vkf, uint32_t bpp, int a8, int stex)
 {
@@ -1062,11 +1069,18 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
         if ((size_t)w * (bpp ? bpp : 4) <= row && h <= sh && row % 32 == 0) {
             nvk_buffer vb;
             if (!nvmtl_vk_surface_vram(IOSurfaceGetID(surf), 0, row * h, &vb)) {
-                if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &vb, 0, row, &t->_i)) {
+                // The family-VRAM alias is the usual image for a drawable, so it must be writable here as well: the usage
+                // nvmtl_surface_usage reports only claims ShaderWrite for an image that really is a storage image. The
+                // alias keeps storage only if the format has it with linear tiling, and logs when it drops it.
+                const int vstex = stex || nvmtl_surface_writable_by_default(t->_fbo);
+                if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, vstex, 1, &vb, 0, row, &t->_i)) {
                     t->_vramBuf = vb; t->_vramOn = YES; g_surf_vram++;
                     uint32_t seed = IOSurfaceGetSeed(surf);
                     int current = nvmtl_vram_tag_current(surf, 0, seed);
                     if (current) { t->_surfSeed = seed; t->_surfSynced = YES; }
+                    if (vstex && !stex) { static unsigned wn; if (wn++ < 8)
+                        nvlog("item 7: surface %u %ux%u: ShaderWrite was not asked for, the VRAM alias is made writable anyway (storage %s)",
+                              (unsigned)IOSurfaceGetID(surf), w, h, t->_i.storage ? "kept" : "dropped by the format"); }
                     static unsigned n; if (n++ < 8 || n % 2000 == 0)
                         nvlog("item 7: surface %u %ux%u pitch %zu -> the family's VRAM%s (vram %llu, private %llu)", (unsigned)IOSurfaceGetID(surf),
                               w, h, row, current ? ", already current (no upload)" : "", g_surf_vram, g_surf_private);
@@ -1095,15 +1109,13 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
 // destination. QuartzCore hands this driver a descriptor whose usage is only ShaderRead for it, so Core Image refuses the
 // texture ("texture usage must include MTLTextureUsageShaderWrite") and Photo Booth's preview stays black. The surface's
 // image is already writable whenever its format allows (see nvmtl_surface_image_create), so say so.
-// WindowServer keeps the usage it asked for: it wraps hundreds of surfaces a second, none of them Core Image targets.
+// WindowServer keeps the usage it asked for (see nvmtl_surface_writable_by_default).
 static NSUInteger nvmtl_surface_usage(NSUInteger usage, BOOL fbo, BOOL storage) {
     // Unknown permits shader writes too. Adding only ShaderRead/RenderTarget to a
     // non-storage surface would forbid its optimal-tiled storage twin below
     // (ImageIO's RGBA16Unorm outputs), silently sending those writes to a dummy.
     if (usage == MTLTextureUsageUnknown) return usage;
-    static int ws = -1;
-    if (ws < 0) { const char *me = getprogname(); ws = me && !strcmp(me, "WindowServer"); }
-    if (!fbo && !ws) {
+    if (nvmtl_surface_writable_by_default(fbo)) {
         usage |= MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
         if (storage) usage |= MTLTextureUsageShaderWrite;
     }
